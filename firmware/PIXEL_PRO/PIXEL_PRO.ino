@@ -44,7 +44,7 @@
 USBCDC USBSerial;
 #endif
 
-static constexpr char FW_VERSION[] = "1.10.27";
+static constexpr char FW_VERSION[] = "1.10.28";
 static constexpr uint16_t USB_VID_PIXEL = 0x303A;
 static constexpr uint16_t USB_PID_PIXEL = 0x80C2;
 static constexpr uint8_t KEY_COUNT = 8;
@@ -574,6 +574,10 @@ static bool menuBatchActive = false;
 static bool menuBatchDirty = false;
 static uint8_t menuBatchProfile = 0;
 static uint32_t menuBatchLastActivityAt = 0;
+static bool menuRenderPending = false;
+static uint8_t menuRenderPendingProfile = 0;
+static uint32_t menuRenderNotBeforeAt = 0;
+static constexpr uint32_t MENU_RENDER_DEFER_MS = 120UL;
 static uint8_t menuLastContentProfile = 0;
 static uint8_t menuRenderedProfile = 0;
 static uint32_t menuCompositeMask = 0;
@@ -2602,6 +2606,10 @@ static int mainMenuJpegDraw(JPEGDRAW *draw) {
                 draw->iWidth,
         static_cast<uint16_t>(
             width));
+
+    if ((row & 0x03) == 0x03) {
+      delay(0);
+    }
   }
 
   return 1;
@@ -3940,6 +3948,23 @@ static const char *resetReasonName(
   }
 }
 
+static void scheduleMainMenuRender(
+    uint8_t profile,
+    uint32_t delayMs = MENU_RENDER_DEFER_MS) {
+  if (profile >= PROFILE_COUNT ||
+      profile != activeProfile ||
+      saverActive ||
+      !displayReady) {
+    return;
+  }
+
+  menuRenderPending = true;
+  menuRenderPendingProfile = profile;
+  menuRenderNotBeforeAt =
+      millis() +
+      delayMs;
+}
+
 static void requestMainMenuRender(
     uint8_t profile) {
   if (profile >= PROFILE_COUNT ||
@@ -3957,7 +3982,8 @@ static void requestMainMenuRender(
     return;
   }
 
-  renderMainMenu();
+  scheduleMainMenuRender(
+      profile);
 }
 
 static void beginMainMenuBatch(
@@ -3975,7 +4001,7 @@ static void beginMainMenuBatch(
 static void endMainMenuBatch(
     uint8_t profile) {
   if (!menuBatchActive) {
-    requestMainMenuRender(
+    scheduleMainMenuRender(
         profile);
     return;
   }
@@ -3992,7 +4018,7 @@ static void endMainMenuBatch(
   menuBatchLastActivityAt = 0;
 
   if (render) {
-    requestMainMenuRender(
+    scheduleMainMenuRender(
         batchProfile);
   }
 }
@@ -4023,9 +4049,51 @@ static void pollMainMenuBatchTimeout() {
   menuBatchLastActivityAt = 0;
 
   if (render) {
-    requestMainMenuRender(
+    scheduleMainMenuRender(
         profile);
   }
+}
+
+static void pollDeferredMainMenuRender() {
+  if (!menuRenderPending ||
+      rawMediaKind != RAW_MEDIA_NONE ||
+      menuBatchActive ||
+      saverActive ||
+      !displayReady) {
+    return;
+  }
+
+  const uint32_t now =
+      millis();
+
+  if (static_cast<int32_t>(
+          now -
+          menuRenderNotBeforeAt) <
+      0) {
+    return;
+  }
+
+  if (USBSerial.available() > 0 ||
+      cdcLine.length() > 0) {
+    menuRenderNotBeforeAt =
+        now + 25;
+    return;
+  }
+
+  const uint8_t profile =
+      menuRenderPendingProfile;
+
+  menuRenderPending = false;
+  menuRenderNotBeforeAt = 0;
+
+  if (profile != activeProfile) {
+    return;
+  }
+
+  renderMainMenu();
+
+  // Give TinyUSB a scheduling point after the full 480x320 JPEG render.
+  delay(0);
 }
 
 static void closeMenuUpload() {
@@ -10050,7 +10118,11 @@ static void handleCommand(String command) {
     menuBatchDirty = false;
     menuBatchLastActivityAt = 0;
     stopSaver();
-    renderMainMenu();
+
+    scheduleMainMenuRender(
+        activeProfile,
+        MENU_RENDER_DEFER_MS);
+
     cdcPrintln("OK|MENUSHOW");
     return;
   }
@@ -14712,6 +14784,7 @@ void loop() {
   }
 
   pollMainMenuBatchTimeout();
+  pollDeferredMainMenuRender();
   pollRgbEffect();
   pollSaver();
   if (!PIXEL_DIAG_TOUCH_OFF) {
