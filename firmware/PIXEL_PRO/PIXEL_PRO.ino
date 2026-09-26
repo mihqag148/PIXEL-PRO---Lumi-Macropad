@@ -44,7 +44,7 @@
 USBCDC USBSerial;
 #endif
 
-static constexpr char FW_VERSION[] = "1.10.26";
+static constexpr char FW_VERSION[] = "1.10.27";
 static constexpr uint16_t USB_VID_PIXEL = 0x303A;
 static constexpr uint16_t USB_PID_PIXEL = 0x80C2;
 static constexpr uint8_t KEY_COUNT = 8;
@@ -4451,7 +4451,7 @@ static bool finishMenuBackgroundUpload() {
     return false;
   }
 
-  uint8_t profile =
+  const uint8_t profile =
       menuUploadProfile;
 
   char finalPath[24] = {};
@@ -4475,6 +4475,9 @@ static bool finishMenuBackgroundUpload() {
       backupPath,
       sizeof(backupPath));
 
+  // Do not instantiate JPEGDEC or touch the TFT in the final raw-data
+  // callback. That path runs inline with native USB receive and was the last
+  // operation before the observed CDC disconnect around the final chunk.
   menuUploadFile.flush();
   menuUploadFile.close();
 
@@ -4488,48 +4491,67 @@ static bool finishMenuBackgroundUpload() {
     return false;
   }
 
-  JPEGDEC decoder;
+  const size_t fileSize =
+      file.size();
 
   bool valid =
-      decoder.open(
-          file,
-          mainMenuJpegDraw) &&
-      decoder.getWidth() ==
-          TFT_WIDTH &&
-      decoder.getHeight() ==
-          TFT_HEIGHT &&
-      file.size() ==
-          menuUploadExpectedBytes;
+      fileSize ==
+          menuUploadExpectedBytes &&
+      fileSize >= 4;
 
-  decoder.close();
+  uint8_t first[2] = {};
+  uint8_t last[2] = {};
+
+  if (valid) {
+    valid =
+        file.read(
+            first,
+            sizeof(first)) ==
+            sizeof(first) &&
+        first[0] == 0xFF &&
+        first[1] == 0xD8;
+  }
+
+  if (valid) {
+    valid =
+        file.seek(
+            fileSize - 2) &&
+        file.read(
+            last,
+            sizeof(last)) ==
+            sizeof(last) &&
+        last[0] == 0xFF &&
+        last[1] == 0xD9;
+  }
+
   file.close();
 
   if (!valid) {
-    LittleFS.remove(tempPath);
+    LittleFS.remove(
+        tempPath);
+
     closeMenuUpload();
     return false;
   }
 
-  bool committed =
+  const bool committed =
       replaceLittleFsFileAtomically(
           tempPath,
           finalPath,
           backupPath);
 
   if (!committed) {
-    LittleFS.remove(tempPath);
+    LittleFS.remove(
+        tempPath);
+
     closeMenuUpload();
     return false;
   }
 
+  // Only commit the file here. The app sends MENUMODE / MENUCFG / MENUSHOW
+  // after MEDIA_RAW_DONE, so preferences and rendering happen outside the
+  // time-critical USB finalizer.
   closeMenuUpload();
-
-  rememberMainMenuContentProfile(
-      profile);
-
-  requestMainMenuRender(
-      profile);
-
   return true;
 }
 
